@@ -1,0 +1,25 @@
+{
+  "name": "outdoor-weather-planner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev --host 0.0.0.0",
+    "build": "astro build",
+    "preview": "astro preview --host 0.0.0.0",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "@astrojs/preact": "^3.5.3",
+    "astro": "^4.16.18",
+    "lucide-preact": "^0.468.0",
+    "preact": "^10.25.0",
+    "uplot": "^1.6.31"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

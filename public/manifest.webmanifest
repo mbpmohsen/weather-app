@@ -1,0 +1,17 @@
+{
+  "name": "Trailwise Weather Planner",
+  "short_name": "Trailwise",
+  "description": "Fast outdoor weather planning for hiking, trekking, camping, fishing, and custom plans.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f7ef",
+  "theme_color": "#123b2f",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

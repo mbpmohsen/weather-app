@@ -1,0 +1,30 @@
+---
+import OutdoorPlanner from "../components/OutdoorPlanner";
+import "../styles/global.css";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="A fast outdoor weather decision assistant for hiking, trekking, camping, fishing, and custom plans."
+    />
+    <meta name="theme-color" content="#123b2f" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icons/icon.svg" />
+    <title>Trailwise Weather Planner</title>
+  </head>
+  <body>
+    <OutdoorPlanner client:load />
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+        });
+      }
+    </script>
+  </body>
+</html>

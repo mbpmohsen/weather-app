@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-label="Trailwise icon">
+  <rect width="192" height="192" rx="42" fill="#123b2f"/>
+  <path d="M22 139h148L119 54l-27 45-16-25-54 65Z" fill="#dce7c4"/>
+  <path d="M74 139 119 54l51 85H74Z" fill="#7ebc89"/>
+  <path d="M91 139c10-23 23-34 39-34 13 0 25 7 36 20l4 14H91Z" fill="#f2b84b"/>
+  <circle cx="148" cy="49" r="17" fill="#f6d36d"/>
+</svg>
