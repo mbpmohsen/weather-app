@@ -6,7 +6,6 @@ import {
   Clock,
   CloudSun,
   Compass,
-  Copy,
   Fish,
   LocateFixed,
   LoaderCircle,
@@ -62,9 +61,25 @@ const iconByMode = {
   custom: SlidersHorizontal
 };
 
-function formatCoordinates(coordinates: Coordinates): string {
-  return `${coordinates.lat.toFixed(5)}, ${coordinates.lng.toFixed(5)}`;
+/** One formatter for every place a coordinate is shown, so the fields never disagree. */
+function formatAxis(value: number): string {
+  return String(Number(value.toFixed(5)));
 }
+
+function formatCoordinates(coordinates: Coordinates): string {
+  return `${formatAxis(coordinates.lat)}, ${formatAxis(coordinates.lng)}`;
+}
+
+function formatDayLong(date: string): string {
+  return new Intl.DateTimeFormat("en", { weekday: "long", month: "short", day: "numeric" }).format(new Date(`${date}T12:00:00`));
+}
+
+function sameCoords(a: Coordinates | null, b: Coordinates | null): boolean {
+  if (!a || !b) return false;
+  return Math.abs(a.lat - b.lat) < 6e-6 && Math.abs(a.lng - b.lng) < 6e-6;
+}
+
+type LocationSource = "map" | "combined" | "split" | "other";
 
 function todayYmd(): string {
   const date = new Date();
@@ -460,9 +475,7 @@ function DailyExplanationList({ days, activity }: { days: ScoredDay[]; activity:
           return (
             <article key={day.date} className="daily-item">
               <div>
-                <h3>
-                  {new Intl.DateTimeFormat("en", { weekday: "long", month: "short", day: "numeric" }).format(new Date(`${day.date}T12:00:00`))}
-                </h3>
+                <h3>{formatDayLong(day.date)}</h3>
                 <p>{explanation.summarySentence}</p>
               </div>
               <dl>
@@ -497,7 +510,9 @@ function ForecastResults({
   days,
   selection,
   lastUpdated,
-  stale
+  stale,
+  location,
+  refreshing
 }: {
   forecast: OpenMeteoResponse;
   activity: ActivityMode;
@@ -505,9 +520,13 @@ function ForecastResults({
   selection: VariableSelection;
   lastUpdated: number | null;
   stale: boolean;
+  location: Coordinates | null;
+  refreshing: boolean;
 }) {
   const summary = summarizeScores(days);
-  const featured = summary.bestDay || days[0];
+  const best = summary.bestDay || days[0];
+  const [pickedDate, setPickedDate] = useState<string | null>(null);
+  const featured = days.find((day) => day.date === pickedDate) || best;
   if (!featured) {
     return (
       <section className="results-empty">
@@ -517,24 +536,46 @@ function ForecastResults({
   }
 
   return (
-    <div className="results-content">
+    <div className={`results-content ${refreshing ? "is-refreshing" : ""}`} aria-busy={refreshing}>
       <section className="activity-summary">
         <div>
-          <p className="eyebrow">{getActivityPreset(activity).label} plan</p>
+          <p className="eyebrow">
+            {getActivityPreset(activity).label} plan{location ? ` · ${formatCoordinates(location)}` : ""}
+          </p>
           <h2>
-            {getActivityPreset(activity).label} near selected location looks {featured.label}
+            Best day is {formatDayLong(best.date)}: {best.label}
           </h2>
           <p>
-            Best day: {new Intl.DateTimeFormat("en", { weekday: "long", month: "short", day: "numeric" }).format(new Date(`${featured.date}T12:00:00`))}
-            {featured.bestWindow ? `, ${featured.bestWindow.start}-${featured.bestWindow.end}.` : "."}
+            {best.bestWindow ? `Go between ${best.bestWindow.start} and ${best.bestWindow.end}. ` : "No clean window that day. "}
+            Tap any day below to see its details.
           </p>
         </div>
-        <div className="updated-pill">
-          <CloudSun size={16} aria-hidden="true" />
-          <span>{stale ? "Cached forecast" : "Last updated"} {formatSavedAt(lastUpdated)}</span>
+        <div className={`updated-pill ${stale ? "is-stale" : ""}`}>
+          {refreshing ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <CloudSun size={16} aria-hidden="true" />}
+          <span>{refreshing ? "Updating…" : `${stale ? "Offline copy from" : "Updated"} ${formatSavedAt(lastUpdated)}`}</span>
         </div>
       </section>
 
+      <section className="daily-score-strip" aria-label="Pick a day">
+        {days.map((day) => (
+          <button
+            key={day.date}
+            type="button"
+            className={`daily-score ${statusClass(day.label)} ${day.date === featured.date ? "is-selected" : ""}`}
+            aria-pressed={day.date === featured.date}
+            onClick={() => setPickedDate(day.date)}
+          >
+            <span>
+              {new Intl.DateTimeFormat("en", { weekday: "short", day: "numeric" }).format(new Date(`${day.date}T12:00:00`))}
+              {day.date === best.date ? " ★" : ""}
+            </span>
+            <strong>{day.score}</strong>
+            <small>{day.label}</small>
+          </button>
+        ))}
+      </section>
+
+      <h3 className="featured-day-title">{formatDayLong(featured.date)}</h3>
       <div className="score-layout">
         <OutdoorScoreCard day={featured} />
         <BestTimeWindowCard day={featured} />
@@ -542,16 +583,6 @@ function ForecastResults({
       </div>
 
       <RiskCards day={featured} />
-
-      <section className="daily-score-strip" aria-label="Scores by day">
-        {days.map((day) => (
-          <article key={day.date} className={`daily-score ${statusClass(day.label)}`}>
-            <span>{new Intl.DateTimeFormat("en", { weekday: "short" }).format(new Date(`${day.date}T12:00:00`))}</span>
-            <strong>{day.score}</strong>
-            <small>{day.label}</small>
-          </article>
-        ))}
-      </section>
 
       <section className="weather-summary" aria-labelledby="summary-heading">
         <div className="section-heading">
@@ -561,11 +592,11 @@ function ForecastResults({
         <dl>
           <div>
             <dt>Best day</dt>
-            <dd>{summary.bestDay ? `${summary.bestDay.date} (${summary.bestDay.label})` : "Not available"}</dd>
+            <dd>{summary.bestDay ? `${formatDayLong(summary.bestDay.date)} (${summary.bestDay.label})` : "Not available"}</dd>
           </div>
           <div>
             <dt>Worst day</dt>
-            <dd>{summary.worstDay ? `${summary.worstDay.date} (${summary.worstDay.label})` : "Not available"}</dd>
+            <dd>{summary.worstDay ? `${formatDayLong(summary.worstDay.date)} (${summary.worstDay.label})` : "Not available"}</dd>
           </div>
           <div>
             <dt>Best activity window</dt>
@@ -595,8 +626,8 @@ export default function OutdoorPlanner() {
   const [coordinates, setCoordinates] = useState<Coordinates | null>(initial.coordinates);
   const [center, setCenter] = useState<Coordinates>(initial.center);
   const [coordinateText, setCoordinateText] = useState(initial.coordinates ? formatCoordinates(initial.coordinates) : "");
-  const [latText, setLatText] = useState(initial.coordinates ? `${initial.coordinates.lat}` : "");
-  const [lngText, setLngText] = useState(initial.coordinates ? `${initial.coordinates.lng}` : "");
+  const [latText, setLatText] = useState(initial.coordinates ? formatAxis(initial.coordinates.lat) : "");
+  const [lngText, setLngText] = useState(initial.coordinates ? formatAxis(initial.coordinates.lng) : "");
   const [coordinateError, setCoordinateError] = useState("");
   const [activity, setActivity] = useState<ActivityMode>(initial.activity);
   const [range, setRange] = useState<DateRangeSelection>(initial.range);
@@ -615,6 +646,7 @@ export default function OutdoorPlanner() {
   const [stale, setStale] = useState(false);
   const [recentLocations, setRecentLocations] = useState<RecentLocation[]>([]);
   const [shareStatus, setShareStatus] = useState("");
+  const [splitError, setSplitError] = useState("");
 
   useEffect(() => {
     setRecentLocations(getRecentLocations());
@@ -628,7 +660,11 @@ export default function OutdoorPlanner() {
       }
       const parsed = parseCoordinates(coordinateText);
       setCoordinateError(parsed.ok ? "" : parsed.error || "Invalid coordinates.");
-    }, 250);
+      // Live sync: a valid pair moves the pin and fills Lat/Lng without pressing a button.
+      if (parsed.ok && parsed.coordinates && !sameCoords(parsed.coordinates, coordinatesRef.current)) {
+        setSelectedLocation(parsed.coordinates, "combined");
+      }
+    }, 350);
     return () => window.clearTimeout(handle);
   }, [coordinateText]);
 
@@ -641,17 +677,28 @@ export default function OutdoorPlanner() {
     }
   }, [activity]);
 
-  function setSelectedLocation(next: Coordinates) {
+  const coordinatesRef = useRef(coordinates);
+  coordinatesRef.current = coordinates;
+
+  /**
+   * The single write path for location. Every input, the map, geolocation and recents go
+   * through here, and every display is re-derived from `next`. The field the user is
+   * typing in is left alone so the caret never jumps.
+   */
+  function setSelectedLocation(next: Coordinates, source: LocationSource = "other") {
     setCoordinates(next);
     setCenter(next);
-    setCoordinateText(formatCoordinates(next));
-    setLatText(`${next.lat}`);
-    setLngText(`${next.lng}`);
+    if (source !== "combined") setCoordinateText(formatCoordinates(next));
+    if (source !== "split") {
+      setLatText(formatAxis(next.lat));
+      setLngText(formatAxis(next.lng));
+    }
     setCoordinateError("");
-    setRecentLocations(addRecentLocation(next));
+    setSplitError("");
+    if (source !== "combined" && source !== "split") setRecentLocations(addRecentLocation(next));
   }
 
-  async function requestForecast(nextCoordinates = coordinates, forceRefresh = false) {
+  async function requestForecast(nextCoordinates = coordinates, forceRefresh = false, scroll = true) {
     if (!nextCoordinates) {
       setError("Choose a location first.");
       return;
@@ -682,7 +729,7 @@ export default function OutdoorPlanner() {
         setLastUpdated(cached.savedAt);
         setStale(false);
         setNotice("Loaded a recent cached forecast.");
-        requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+        if (scroll) requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
         return;
       }
     }
@@ -703,7 +750,7 @@ export default function OutdoorPlanner() {
       setLastUpdated(Date.now());
       setStale(false);
       setRecentLocations(addRecentLocation(nextCoordinates));
-      requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+      if (scroll) requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
     } catch (fetchError) {
       if (fetchError instanceof DOMException && fetchError.name === "AbortError" && !timedOut) return;
       const displayError =
@@ -745,7 +792,7 @@ export default function OutdoorPlanner() {
           return;
         }
         setSelectedLocation(next);
-        setNotice("Location selected.");
+        setNotice("");
         if (autoFetchRef.current || auto) {
           autoFetchRef.current = false;
           void requestForecast(next);
@@ -778,13 +825,42 @@ export default function OutdoorPlanner() {
     setSelectedLocation(parsed.coordinates);
   }
 
-  function applySeparateCoordinates() {
-    const parsed = validateCoordinates(Number(latText), Number(lngText));
-    if (!parsed.ok || !parsed.coordinates) {
-      setCoordinateError(parsed.error || "Invalid coordinates.");
+  // Live sync for the separate Lat / Lng fields.
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      if (!latText.trim() || !lngText.trim()) return;
+      const parsed = validateCoordinates(Number(latText.replace(",", ".")), Number(lngText.replace(",", ".")));
+      if (!parsed.ok || !parsed.coordinates) {
+        setSplitError(parsed.error || "Invalid coordinates.");
+        return;
+      }
+      setSplitError("");
+      if (!sameCoords(parsed.coordinates, coordinatesRef.current)) setSelectedLocation(parsed.coordinates, "split");
+    }, 350);
+    return () => window.clearTimeout(handle);
+  }, [latText, lngText]);
+
+  // Once a forecast is on screen, keep it in step with the inputs instead of
+  // silently showing results for a location/activity the user has moved away from.
+  const hasForecast = Boolean(forecast);
+  const settingsKey = JSON.stringify([coordinates, activity, range, selection]);
+  const lastFetchedKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!hasForecast || !coordinates) return;
+    if (lastFetchedKeyRef.current === null) {
+      lastFetchedKeyRef.current = settingsKey;
       return;
     }
-    setSelectedLocation(parsed.coordinates);
+    if (lastFetchedKeyRef.current === settingsKey) return;
+    const handle = window.setTimeout(() => {
+      lastFetchedKeyRef.current = settingsKey;
+      void requestForecast(coordinates, false, false);
+    }, 600);
+    return () => window.clearTimeout(handle);
+  }, [settingsKey, hasForecast]);
+
+  function commitRecent() {
+    if (coordinates) setRecentLocations(addRecentLocation(coordinates));
   }
 
   const scoredDays = useMemo(() => {
@@ -823,10 +899,10 @@ export default function OutdoorPlanner() {
 
       <section className="planner-hero" aria-label="Outdoor weather planner">
         <div className="map-panel">
-          <LightMap selected={coordinates} center={center} onSelect={setSelectedLocation} />
+          <LightMap selected={coordinates} center={center} onSelect={(next) => setSelectedLocation(next, "map")} />
           <div className="map-status">
             <MapPin size={16} aria-hidden="true" />
-            <span>{coordinates ? formatCoordinates(coordinates) : "Tap the map, use location, or enter coordinates"}</span>
+            <span>{coordinates ? formatCoordinates(coordinates) : "Tap the map to drop a pin"}</span>
           </div>
         </div>
 
@@ -851,35 +927,57 @@ export default function OutdoorPlanner() {
                   onKeyDown={(event) => {
                     if (event.key === "Enter") applyCoordinateText();
                   }}
-                  placeholder="35.6892, 51.3890"
+                  onBlur={() => {
+                    if (coordinates) setCoordinateText(formatCoordinates(coordinates));
+                    commitRecent();
+                  }}
+                  placeholder="Paste coordinates or a map link"
                   inputMode="text"
                   aria-invalid={Boolean(coordinateError)}
+                  aria-describedby={coordinateError ? "coordinate-error" : undefined}
                 />
               </label>
-              <button type="button" className="icon-button" onClick={applyCoordinateText} aria-label="Use entered coordinates">
-                <MapPin size={18} aria-hidden="true" />
-              </button>
-              <button type="button" className="icon-button" onClick={() => requestLocation(false)} aria-label="Use browser location">
+              <button type="button" className="icon-button" onClick={() => requestLocation(false)} aria-label="Use my location" title="Use my location">
                 <LocateFixed size={18} aria-hidden="true" />
               </button>
             </div>
-            <div className="split-inputs">
+            {coordinateError ? <p id="coordinate-error" className="error-text">{coordinateError}</p> : null}
+            <div className="split-inputs two">
               <label>
-                <span>Lat</span>
-                <input value={latText} onInput={(event) => setLatText(event.currentTarget.value)} inputMode="decimal" />
+                <span>Latitude</span>
+                <input
+                  value={latText}
+                  onInput={(event) => setLatText(event.currentTarget.value)}
+                  onBlur={() => {
+                    if (coordinates && !splitError) setLatText(formatAxis(coordinates.lat));
+                    commitRecent();
+                  }}
+                  inputMode="decimal"
+                  placeholder="-90 to 90"
+                  aria-invalid={Boolean(splitError)}
+                />
               </label>
               <label>
-                <span>Lng</span>
-                <input value={lngText} onInput={(event) => setLngText(event.currentTarget.value)} inputMode="decimal" />
+                <span>Longitude</span>
+                <input
+                  value={lngText}
+                  onInput={(event) => setLngText(event.currentTarget.value)}
+                  onBlur={() => {
+                    if (coordinates && !splitError) setLngText(formatAxis(coordinates.lng));
+                    commitRecent();
+                  }}
+                  inputMode="decimal"
+                  placeholder="-180 to 180"
+                  aria-invalid={Boolean(splitError)}
+                />
               </label>
-              <button type="button" className="secondary-button compact-button" onClick={applySeparateCoordinates}>
-                Use
-              </button>
             </div>
-            {coordinateError ? <p className="error-text">{coordinateError}</p> : null}
+            {splitError ? <p className="error-text">{splitError}</p> : null}
             {recentLocations.length ? (
               <div className="recent-list" aria-label="Recent locations">
-                {recentLocations.map((recent) => (
+                {recentLocations
+                  .filter((recent) => !(recent.lat === 0 && recent.lng === 0) && !sameCoords(recent, coordinates))
+                  .map((recent) => (
                   <button key={`${recent.lat}-${recent.lng}-${recent.savedAt}`} type="button" onClick={() => setSelectedLocation(recent)}>
                     {recent.label}
                   </button>
@@ -893,9 +991,9 @@ export default function OutdoorPlanner() {
           <AdvancedVariableSelector activity={activity} selection={selection} onChange={setSelection} />
 
           <div className="action-row">
-            <button type="button" className="primary-button" onClick={() => void requestForecast(coordinates)} disabled={loading}>
+            <button type="button" className="primary-button" onClick={() => void requestForecast(coordinates)} disabled={loading || !coordinates}>
               {loading ? <LoaderCircle className="spin" size={18} aria-hidden="true" /> : <CloudSun size={18} aria-hidden="true" />}
-              <span>{loading ? "Checking forecast" : "Check outdoor plan"}</span>
+              <span>{loading ? "Checking forecast…" : coordinates ? "Check outdoor plan" : "Pick a location first"}</span>
             </button>
             <button type="button" className="icon-button" onClick={() => void requestForecast(coordinates, true)} disabled={loading || !forecast} aria-label="Refresh forecast">
               <RefreshCcw size={18} aria-hidden="true" />
@@ -932,15 +1030,17 @@ export default function OutdoorPlanner() {
             selection={selection}
             lastUpdated={lastUpdated}
             stale={stale}
+            location={coordinates}
+            refreshing={loading}
           />
         ) : (
           <section className="empty-results">
             <div>
               <p className="eyebrow">Ready when you are</p>
-              <h2>Choose a location and check the plan</h2>
-              <p>The first forecast will show scores, time windows, risks, gear, explanations, and charts.</p>
+              <h2>{coordinates ? "Location set. Check the plan." : "Start by tapping the map"}</h2>
+              <p>You will get a score for each day, the best hours to go, risks and gear to bring.</p>
             </div>
-            <Copy size={22} aria-hidden="true" />
+            <MapPin size={22} aria-hidden="true" />
           </section>
         )}
       </div>

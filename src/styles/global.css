@@ -140,10 +140,22 @@ a {
   inset: 0;
   touch-action: none;
   user-select: none;
+  cursor: crosshair;
+  outline: none;
+}
+
+.map-canvas:active {
+  cursor: grabbing;
+}
+
+.map-canvas:focus-visible {
+  box-shadow: inset 0 0 0 3px var(--gold);
 }
 
 .map-tile {
   position: absolute;
+  left: 0;
+  top: 0;
   width: 256px;
   height: 256px;
   max-width: none;
@@ -158,8 +170,9 @@ a {
   width: 22px;
   height: 22px;
   border-radius: 999px;
-  background: #ef4444;
+  background: #d9365e;
   border: 3px solid white;
+  margin: -32px 0 0 -11px; /* tip of the pin sits exactly on the coordinate */
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
   pointer-events: none;
   z-index: 20;
@@ -173,7 +186,7 @@ a {
   transform: translateX(-50%);
   border-left: 6px solid transparent;
   border-right: 6px solid transparent;
-  border-top: 10px solid #ef4444;
+  border-top: 10px solid #d9365e;
 }
 
 .map-toolbar {
@@ -380,7 +393,7 @@ button:focus-visible {
 
 .split-inputs {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 8px;
   align-items: end;
 }
@@ -884,6 +897,49 @@ dd {
   }
 }
 
+/* ---- Map + results refinements ---- */
+.icon-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.icon-button.is-attention {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 3px rgba(242, 184, 75, 0.35);
+}
+
+.daily-score {
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  color: var(--ink);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.daily-score:hover {
+  transform: translateY(-1px);
+}
+
+.daily-score.is-selected {
+  box-shadow: 0 0 0 2px var(--green), var(--shadow);
+}
+
+.featured-day-title {
+  margin: 4px 0 -4px;
+  font-size: 1.05rem;
+  color: var(--muted);
+}
+
+.results-content.is-refreshing {
+  opacity: 0.6;
+  transition: opacity 0.2s ease;
+}
+
+.updated-pill.is-stale {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -967,8 +1023,30 @@ dd {
     grid-template-columns: 1fr 1fr;
   }
 
-  .compact-button {
-    grid-column: 1 / -1;
+  .panel-heading h1 {
+    font-size: 1.7rem;
+  }
+
+  .panel-heading > p:last-child {
+    display: none;
+  }
+
+  .control-panel {
+    overflow: visible;
+  }
+
+  .action-row {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    margin: 0 -14px -14px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+    background: rgba(255, 255, 255, 0.96);
+    border-top: 1px solid var(--line);
+  }
+
+  .action-row .primary-button {
+    flex: 1;
   }
 
   .selector-toolbar {
