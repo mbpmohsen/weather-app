@@ -99,3 +99,79 @@ describe("scoringEngine", () => {
     expect(window?.score).toBeGreaterThan(70);
   });
 });
+
+// Regression: rainy days used to score "Excellent"/"Good" because rain cost only 14-24 points
+// and the best window could sit inside rain.
+function rainyDay(date: string, wet: (hour: number) => boolean, mmPerHour: number, probability: number, code: number, sum: number): OpenMeteoResponse {
+  const base = forecast(date);
+  const hourly = base.hourly!;
+  const time = hourly.time as string[];
+  hourly.precipitation = time.map((_, h) => (wet(h) ? mmPerHour : 0));
+  hourly.precipitation_probability = time.map((_, h) => (wet(h) ? probability : 15));
+  hourly.weather_code = time.map((_, h) => (wet(h) ? code : 3));
+  hourly.apparent_temperature = time.map(() => 10);
+  base.daily!.weather_code = [code];
+  base.daily!.precipitation_sum = [sum];
+  base.daily!.precipitation_probability_max = [probability];
+  base.daily!.apparent_temperature_max = [12];
+  base.daily!.apparent_temperature_min = [6];
+  return base;
+}
+
+describe("scoringEngine rain regression", () => {
+  const date = "2026-11-08";
+
+  it("never rates an all-day moderate rain as Good or better", () => {
+    const [day] = scoreForecast(rainyDay(date, () => true, 0.35, 85, 63, 8), "hiking", undefined, null);
+    expect(day.score).toBeLessThan(50);
+    expect(day.bestWindow).toBeNull();
+  });
+
+  it("rates all-day heavy rain as Avoid", () => {
+    const [day] = scoreForecast(rainyDay(date, () => true, 0.5, 95, 65, 12), "hiking", undefined, null);
+    expect(day.label).toBe("Avoid");
+    expect(day.bestWindow).toBeNull();
+  });
+
+  it("keeps a wet morning out of Excellent and only offers dry hours", () => {
+    const [day] = scoreForecast(rainyDay(date, (h) => h < 13, 0.5, 80, 61, 6), "hiking", undefined, null);
+    expect(day.score).toBeLessThan(70);
+    expect(day.bestWindow?.start).toBe("13:00");
+  });
+
+  it("for today, ignores rain that already ended", () => {
+    const wetMorning = rainyDay(date, (h) => h < 13, 0.5, 80, 61, 6);
+    const [day] = scoreForecast(wetMorning, "hiking", undefined, `${date}T13:20`);
+    expect(day.fromTime).toBe("13:00");
+    expect(day.wetHours).toBe(0);
+    expect(day.score).toBeGreaterThanOrEqual(70);
+  });
+
+  it("for today, a rainy afternoon still ahead pulls the score down even if the morning was dry", () => {
+    const wetAfternoon = rainyDay(date, (h) => h >= 12, 0.6, 85, 63, 5);
+    const [day] = scoreForecast(wetAfternoon, "hiking", undefined, `${date}T11:05`);
+    expect(day.score).toBeLessThan(50);
+  });
+
+  it("says daylight is over instead of recommending past hours", () => {
+    const [day] = scoreForecast(forecast(date), "hiking", undefined, `${date}T21:00`);
+    expect(day.bestWindow).toBeNull();
+    expect(day.summary).toContain("Daylight is over");
+  });
+
+  it("does not let a window include a rainy hour", () => {
+    const points: HourPoint[] = Array.from({ length: 6 }, (_, index) => ({
+      time: `${date}T${`${10 + index}`.padStart(2, "0")}:00`,
+      apparent_temperature: 15,
+      precipitation: index === 2 ? 1.2 : 0,
+      precipitation_probability: index === 2 ? 70 : 10,
+      weather_code: index === 2 ? 61 : 1,
+      wind_gusts_10m: 10,
+      visibility: 15000,
+      is_day: 1
+    }));
+    const window = findBestTimeWindow(points, "hiking");
+    expect(window).not.toBeNull();
+    expect(window!.start).toBe("13:00");
+  });
+});

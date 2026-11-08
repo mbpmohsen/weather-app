@@ -26,7 +26,33 @@ function addDays(date: Date, days: number): Date {
   return copy;
 }
 
-export function filterDatesForRange(dates: string[], range: DateRangeSelection, now = new Date()): string[] {
+export type WeekendPreset = "thu-fri" | "fri-sat" | "sat-sun";
+
+export const weekendPresets: Array<{ id: WeekendPreset; label: string; days: number[] }> = [
+  { id: "thu-fri", label: "Thu–Fri", days: [4, 5] },
+  { id: "fri-sat", label: "Fri–Sat", days: [5, 6] },
+  { id: "sat-sun", label: "Sat–Sun", days: [6, 0] }
+];
+
+const thuFriZones = new Set(["Asia/Tehran", "Asia/Kabul"]);
+const friSatZones = new Set([
+  "Asia/Riyadh", "Asia/Dubai", "Asia/Qatar", "Asia/Bahrain", "Asia/Kuwait", "Asia/Muscat",
+  "Asia/Baghdad", "Asia/Amman", "Africa/Cairo", "Asia/Jerusalem", "Asia/Dhaka", "Africa/Algiers", "Africa/Tripoli", "Africa/Khartoum"
+]);
+
+/** Weekend days follow local custom: Thu–Fri in Iran, Fri–Sat in much of the Middle East, Sat–Sun elsewhere. */
+export function defaultWeekend(timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone): WeekendPreset {
+  if (thuFriZones.has(timeZone)) return "thu-fri";
+  if (friSatZones.has(timeZone)) return "fri-sat";
+  return "sat-sun";
+}
+
+export function filterDatesForRange(
+  dates: string[],
+  range: DateRangeSelection,
+  now = new Date(),
+  weekend: WeekendPreset = defaultWeekend()
+): string[] {
   if (range.id === "next7" || range.id === "next16") return dates;
 
   if (range.id === "today") {
@@ -45,10 +71,11 @@ export function filterDatesForRange(dates: string[], range: DateRangeSelection, 
   }
 
   if (range.id === "weekend") {
+    const weekendDays = weekendPresets.find((preset) => preset.id === weekend)?.days ?? [6, 0];
     const weekendDates = dates.filter((date) => {
       const [year, month, day] = date.split("-").map(Number);
       const weekday = new Date(year, month - 1, day).getDay();
-      return weekday === 0 || weekday === 6;
+      return weekendDays.includes(weekday);
     });
     return weekendDates.length ? weekendDates.slice(0, 2) : dates.slice(0, 2);
   }

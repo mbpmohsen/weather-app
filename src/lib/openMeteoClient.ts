@@ -33,6 +33,9 @@ export function buildForecastUrl(request: ForecastRequest): string {
     forecast_days: `${forecastDays}`
   });
 
+  if (typeof request.elevation === "number" && Number.isFinite(request.elevation)) {
+    params.set("elevation", `${Math.round(request.elevation)}`);
+  }
   if (variables.current.length) params.set("current", variables.current.join(","));
   if (variables.hourly.length) params.set("hourly", variables.hourly.join(","));
   if (variables.daily.length) params.set("daily", variables.daily.join(","));

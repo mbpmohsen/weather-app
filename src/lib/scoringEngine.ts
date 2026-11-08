@@ -22,6 +22,38 @@ const thunderCodes = new Set([95, 96, 99]);
 const snowCodes = new Set([71, 73, 75, 77, 85, 86]);
 const fogCodes = new Set([45, 48]);
 const rainCodes = new Set([51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]);
+const drizzleCodes = new Set([51, 53, 55, 56, 57]);
+
+/** Precipitation (mm/h) at or above this counts as a wet hour. */
+const WET_HOUR_MM = 0.2;
+/** Probability (%) at or above this counts as a wet hour even with no amount forecast. */
+const WET_HOUR_PROBABILITY = 60;
+
+/**
+ * An hour is "wet" when Open-Meteo forecasts measurable precipitation, a likely chance of it,
+ * or a rain/snow/thunder weather code. Wet hours can never be part of a best window.
+ */
+export function isWetHour(hour: Record<string, unknown>): boolean {
+  const amount =
+    (asNumber(hour.precipitation) ?? 0) + (asNumber(hour.rain) ?? 0) + (asNumber(hour.showers) ?? 0) + (asNumber(hour.snowfall) ?? 0);
+  const probability = asNumber(hour.precipitation_probability) ?? 0;
+  const code = asNumber(hour.weather_code);
+  const wetCode = code !== null && (rainCodes.has(code) || snowCodes.has(code) || thunderCodes.has(code));
+  return amount >= WET_HOUR_MM || probability >= WET_HOUR_PROBABILITY || wetCode;
+}
+
+/**
+ * Current wall-clock time at the forecast location, as "YYYY-MM-DDTHH:MM".
+ * Prefers Open-Meteo's own `current.time`; falls back to the UTC offset it returns.
+ */
+export function locationNow(forecast: OpenMeteoResponse, nowMs = Date.now()): string | null {
+  const currentTime = forecast.current?.time;
+  if (typeof currentTime === "string" && currentTime.length >= 13) return currentTime.slice(0, 16);
+  if (typeof forecast.utc_offset_seconds === "number") {
+    return new Date(nowMs + forecast.utc_offset_seconds * 1000).toISOString().slice(0, 16);
+  }
+  return null;
+}
 
 function clamp(value: number, min = 0, max = 100): number {
   return Math.min(max, Math.max(min, value));
@@ -161,6 +193,7 @@ function hourSuitability(hour: HourPoint, activity: ActivityMode): number {
   if (weatherCode !== null && thunderCodes.has(weatherCode)) score -= 80;
   if (weatherCode !== null && fogCodes.has(weatherCode)) score -= 18;
   if (weatherCode !== null && snowCodes.has(weatherCode)) score -= activity === "trekking" ? 35 : 28;
+  if (weatherCode !== null && rainCodes.has(weatherCode)) score -= drizzleCodes.has(weatherCode) ? 12 : 22;
   if (precipitationProbability >= 80) score -= 26;
   else if (precipitationProbability >= 55) score -= 16;
   else if (precipitationProbability >= 35) score -= 8;
@@ -199,6 +232,7 @@ export function findBestTimeWindow(hours: HourPoint[], activity: ActivityMode): 
     for (let length = config.min; length <= config.max; length += 1) {
       const slice = hours.slice(start, start + length);
       if (slice.length !== length) continue;
+      if (slice.some(isWetHour)) continue;
       const average = slice.reduce((sum, hour) => sum + hourSuitability(hour, activity), 0) / slice.length;
       const daylightShare = slice.filter((hour) => asNumber(hour.is_day) !== 0).length / slice.length;
       const setupBonus =
@@ -254,12 +288,34 @@ function buildSummary(activity: ActivityMode, date: string, label: ScoreLabel, b
   const dayLabel = weekday(date);
   if (label === "Avoid") return `${dayLabel} looks unsuitable for ${activityName}; risk is elevated.`;
   if (label === "Risky") return `${dayLabel} looks risky for ${activityName}; use a conservative plan.`;
-  if (bestWindow) return `${dayLabel} looks ${label.toLowerCase()} for ${activityName}, especially ${bestWindow.start}-${bestWindow.end}.`;
+  if (bestWindow) return `${dayLabel} looks ${label.toLowerCase()} for ${activityName}, especially ${bestWindow.start}–${bestWindow.end}.`;
   return `${dayLabel} looks ${label.toLowerCase()} for ${activityName}, but no standout time window was found.`;
 }
 
-function scoreDay(forecast: OpenMeteoResponse, activity: ActivityMode, date: string, dayIndex: number): ScoredDay {
-  const hours = hourlyForDate(forecast, date);
+function relevantHours(hours: HourPoint[], activity: ActivityMode): HourPoint[] {
+  if (activity === "camping") return hours;
+  const daylight = hours.filter((hour) => asNumber(hour.is_day) !== 0);
+  return daylight.length ? daylight : hours;
+}
+
+/** Caps the score by the share of activity hours that are wet, so a rainy day can't read as Good. */
+function wetShareCap(wetShare: number, heavy: boolean): number {
+  if (wetShare >= 0.75) return heavy ? 25 : 35;
+  if (wetShare >= 0.5) return 55;
+  if (wetShare >= 0.25) return 72;
+  return 100;
+}
+
+function scoreDay(forecast: OpenMeteoResponse, activity: ActivityMode, date: string, dayIndex: number, now: string | null): ScoredDay {
+  const allHours = hourlyForDate(forecast, date);
+  const isToday = now !== null && datePart(now) === date;
+  const nowHour = now !== null ? `${now.slice(0, 13)}:00` : null;
+  const remaining = isToday && nowHour ? allHours.filter((hour) => hour.time >= nowHour) : allHours;
+  const dayOver = isToday && activity !== "camping" && remaining.length > 0 && !remaining.some((hour) => asNumber(hour.is_day) === 1) && allHours.some((hour) => asNumber(hour.is_day) === 1);
+  // For today, judge only the hours still ahead; daily totals include hours that already passed.
+  const hours = isToday && remaining.length && !dayOver ? remaining : allHours;
+  const preferHourly = isToday && remaining.length > 0 && !dayOver;
+  const pick = (daily: number | null, hourly: number | null): number | null => (preferHourly ? hourly ?? daily : daily ?? hourly);
   const risks: RiskCard[] = [];
   const warnings: string[] = [];
   const severeRisks: string[] = [];
@@ -267,15 +323,15 @@ function scoreDay(forecast: OpenMeteoResponse, activity: ActivityMode, date: str
   const gear = new Set(baseGear[activity]);
   const scoreRef = { value: 100 };
 
-  const rainProbability = dailyNumber(forecast, "precipitation_probability_max", dayIndex) ?? maxHourly(hours, "precipitation_probability") ?? 0;
-  const precipitation = dailyNumber(forecast, "precipitation_sum", dayIndex) ?? sumHourly(hours, "precipitation") ?? 0;
-  const showers = dailyNumber(forecast, "showers_sum", dayIndex) ?? sumHourly(hours, "showers") ?? 0;
-  const snowfall = dailyNumber(forecast, "snowfall_sum", dayIndex) ?? sumHourly(hours, "snowfall") ?? 0;
-  const maxGust = dailyNumber(forecast, "wind_gusts_10m_max", dayIndex) ?? maxHourly(hours, "wind_gusts_10m") ?? 0;
-  const maxWind = dailyNumber(forecast, "wind_speed_10m_max", dayIndex) ?? maxHourly(hours, "wind_speed_10m") ?? 0;
+  const rainProbability = pick(dailyNumber(forecast, "precipitation_probability_max", dayIndex), maxHourly(hours, "precipitation_probability")) ?? 0;
+  const precipitation = pick(dailyNumber(forecast, "precipitation_sum", dayIndex), sumHourly(hours, "precipitation")) ?? 0;
+  const showers = pick(dailyNumber(forecast, "showers_sum", dayIndex), sumHourly(hours, "showers")) ?? 0;
+  const snowfall = pick(dailyNumber(forecast, "snowfall_sum", dayIndex), sumHourly(hours, "snowfall")) ?? 0;
+  const maxGust = pick(dailyNumber(forecast, "wind_gusts_10m_max", dayIndex), maxHourly(hours, "wind_gusts_10m")) ?? 0;
+  const maxWind = pick(dailyNumber(forecast, "wind_speed_10m_max", dayIndex), maxHourly(hours, "wind_speed_10m")) ?? 0;
   const minVisibility = minHourly(hours, "visibility");
   const uvIndex = dailyNumber(forecast, "uv_index_max", dayIndex) ?? maxHourly(hours, "uv_index");
-  const weatherCode = dailyNumber(forecast, "weather_code", dayIndex);
+  const weatherCode = preferHourly ? null : dailyNumber(forecast, "weather_code", dayIndex);
   const apparentMax = dailyNumber(forecast, "apparent_temperature_max", dayIndex) ?? maxHourly(hours, "apparent_temperature");
   const apparentMin = dailyNumber(forecast, "apparent_temperature_min", dayIndex) ?? minHourly(hours, "apparent_temperature");
   const soilMoisture = avgHourly(hours, "soil_moisture_0_to_1cm") ?? avgHourly(hours, "soil_moisture_1_to_3cm");
@@ -320,7 +376,7 @@ function scoreDay(forecast: OpenMeteoResponse, activity: ActivityMode, date: str
         detail: "Rain risk is high enough to make the plan less reliable.",
         gear: ["Rain shell", "waterproof shoes", "dry bag"]
       },
-      activity === "camping" ? 28 : 24,
+      activity === "camping" ? 40 : 36,
       scoreRef
     );
   } else if (precipitation >= 2 || rainProbability >= 60 || hasRainCode) {
@@ -336,7 +392,7 @@ function scoreDay(forecast: OpenMeteoResponse, activity: ActivityMode, date: str
         detail: "Rain or showers may affect comfort and footing.",
         gear: ["Rain shell", "waterproof shoes"]
       },
-      activity === "camping" ? 18 : 14,
+      activity === "camping" ? 26 : 22,
       scoreRef
     );
   } else {
@@ -650,13 +706,28 @@ function scoreDay(forecast: OpenMeteoResponse, activity: ActivityMode, date: str
     }
   }
 
-  const bestWindow = findBestTimeWindow(hours, activity);
-  const avoidWindow = findAvoidWindow(hours, activity);
+  const activityHours = relevantHours(hours, activity);
+  const wetHours = activityHours.filter(isWetHour).length;
+  const wetShare = activityHours.length ? wetHours / activityHours.length : 0;
+  const hourlyMean = activityHours.length
+    ? activityHours.reduce((sum, hour) => sum + hourSuitability(hour, activity), 0) / activityHours.length
+    : scoreRef.value;
+
+  const bestWindow = dayOver ? null : findBestTimeWindow(hours, activity);
+  // Only warn about hours the user would actually be out: daylight, except for camping.
+  const avoidWindow = dayOver ? null : findAvoidWindow(relevantHours(hours, activity), activity);
   if (!bestWindow) scoreRef.value -= activity === "camping" ? 8 : 12;
 
-  const finalScore = Math.round(clamp(scoreRef.value));
+  // The daily risk score and the hour-by-hour picture must agree; the lower one wins most of the weight.
+  const riskScore = clamp(scoreRef.value);
+  const blended = Math.min(riskScore, hourlyMean) * 0.7 + Math.max(riskScore, hourlyMean) * 0.3;
+  const finalScore = Math.round(Math.min(blended, wetShareCap(wetShare, precipitation >= 10 || rainProbability >= 90)));
   const label = scoreLabel(finalScore);
-  const summary = buildSummary(activity, date, label, bestWindow);
+  const summary = dayOver
+    ? `Daylight is over for today; check tomorrow for ${activityLabels[activity]}.`
+    : wetShare >= 0.5
+      ? `${weekday(date)} is wet for ${activityLabels[activity]}: rain in ${wetHours} of ${activityHours.length} ${isToday ? "remaining " : ""}${activity === "camping" ? "" : "daylight "}hours${bestWindow ? `; driest window ${bestWindow.start}–${bestWindow.end}` : ""}.`
+      : buildSummary(activity, date, label, bestWindow);
   const topRisk = severeRisks[0] || warnings[0];
   const details = topRisk
     ? `${positiveFactors.slice(0, 2).join(" and ") || "Some conditions are usable"}, but ${topRisk.charAt(0).toLowerCase()}${topRisk.slice(1)}`
@@ -675,16 +746,24 @@ function scoreDay(forecast: OpenMeteoResponse, activity: ActivityMode, date: str
     avoidWindow,
     gear: [...gear].slice(0, 10),
     summary,
-    details
+    details,
+    wetHours,
+    consideredHours: activityHours.length,
+    fromTime: isToday && !dayOver && nowHour ? formatTime(nowHour) : null
   };
 }
 
-export function scoreForecast(forecast: OpenMeteoResponse, activity: ActivityMode, allowedDates?: string[]): ScoredDay[] {
+export function scoreForecast(
+  forecast: OpenMeteoResponse,
+  activity: ActivityMode,
+  allowedDates?: string[],
+  now: string | null = locationNow(forecast)
+): ScoredDay[] {
   const dailyDates = ((forecast.daily?.time as string[] | undefined) || []) as string[];
   const hourlyDates = Array.from(new Set(((forecast.hourly?.time as string[] | undefined) || []).map(datePart)));
   const dates = dailyDates.length ? dailyDates : hourlyDates;
   const filteredDates = allowedDates?.length ? dates.filter((date) => allowedDates.includes(date)) : dates;
-  return filteredDates.map((date) => scoreDay(forecast, activity, date, dates.indexOf(date)));
+  return filteredDates.map((date) => scoreDay(forecast, activity, date, dates.indexOf(date), now));
 }
 
 export function summarizeScores(days: ScoredDay[]): ForecastSummary {

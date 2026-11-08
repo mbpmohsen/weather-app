@@ -29,6 +29,7 @@ export function makeForecastCacheKey(request: ForecastRequest): string {
     request.longitude.toFixed(4),
     request.activity,
     request.forecastDays,
+    request.elevation ?? "",
     variables.current.join("."),
     variables.hourly.join("."),
     variables.daily.join(".")

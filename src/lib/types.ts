@@ -55,11 +55,15 @@ export interface ForecastRequest {
   activity: ActivityMode;
   forecastDays: number;
   variables: VariableSelection;
+  /** Metres. Open-Meteo downscales the forecast to this elevation (e.g. a summit) instead of the terrain model height. */
+  elevation?: number;
 }
 
 export interface OpenMeteoResponse {
   latitude: number;
   longitude: number;
+  /** Elevation (m) the forecast was computed for. */
+  elevation?: number;
   timezone?: string;
   timezone_abbreviation?: string;
   utc_offset_seconds?: number;
@@ -107,6 +111,11 @@ export interface ScoredDay {
   gear: string[];
   summary: string;
   details: string;
+  /** Activity hours (daylight, or all hours for camping) with rain, snow or a likely chance of it. */
+  wetHours?: number;
+  consideredHours?: number;
+  /** For today: scoring starts at this local time ("HH:MM"); earlier hours are ignored. */
+  fromTime?: string | null;
 }
 
 export interface ForecastSummary {

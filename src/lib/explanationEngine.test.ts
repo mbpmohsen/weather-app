@@ -22,8 +22,17 @@ describe("explanationEngine", () => {
 
     const explanation = explainDay(day, "Trekking");
     expect(explanation.summarySentence).toContain("Saturday looks good for trekking");
-    expect(explanation.bestTimeWindow).toContain("07:00-13:00");
+    expect(explanation.bestTimeWindow).toContain("07:00–13:00");
     expect(explanation.gearSuggestions).toContain("Rain shell");
     expect(explanation.reasoning).toContain("Low rain signal");
+  });
+});
+
+describe("explanation wording", () => {
+  it("never says a day 'looks avoid'", () => {
+    const day = { date: "2026-11-08", activity: "hiking", score: 20, label: "Avoid", positiveFactors: [], warnings: [], severeRisks: [], risks: [], bestWindow: null, avoidWindow: null, gear: [], summary: "", details: "" } as const;
+    const text = explainDay({ ...day, positiveFactors: [], warnings: [], severeRisks: [], risks: [], gear: [] }, "Hiking").summarySentence;
+    expect(text).not.toContain("looks avoid");
+    expect(text).toContain("unsuitable");
   });
 });

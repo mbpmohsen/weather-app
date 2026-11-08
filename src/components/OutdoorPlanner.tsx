@@ -17,15 +17,22 @@ import {
   Share2,
   ShieldAlert,
   SlidersHorizontal,
-  Tent
+  Tent,
+  Umbrella,
+  ExternalLink,
+  Layers
 } from "lucide-preact";
+import type { ComponentChildren } from "preact";
 import { lazy, Suspense } from "preact/compat";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { activityModes, activityPresets, getActivityPreset } from "../lib/activityPresets";
 import { parseCoordinates, validateCoordinates } from "../lib/coordinateParser";
-import { dateRangeOptions, filterDatesForRange, forecastDaysForRange } from "../lib/dateRanges";
+import { dateRangeOptions, defaultWeekend, filterDatesForRange, forecastDaysForRange, weekendPresets, type WeekendPreset } from "../lib/dateRanges";
+import { parseElevation, summarizeHighPoint } from "../lib/highPoint";
+import { buildModelComparisonUrl, compareModelsForDate, type ModelAgreement } from "../lib/modelComparison";
 import { explainForecast } from "../lib/explanationEngine";
-import { fetchOpenMeteoForecast, OpenMeteoError } from "../lib/openMeteoClient";
+import { buildNowcast, withCoreVariables, type Nowcast } from "../lib/nowcast";
+import { buildForecastUrl, fetchOpenMeteoForecast, OpenMeteoError } from "../lib/openMeteoClient";
 import { scoreForecast, summarizeScores } from "../lib/scoringEngine";
 import type { ActivityMode, Coordinates, DateRangeSelection, ForecastRequest, OpenMeteoResponse, ScoredDay, VariableSelection, VariableScope } from "../lib/types";
 import {
@@ -47,7 +54,8 @@ import {
   weatherCategories,
   weatherVariableRegistry
 } from "../lib/weatherVariableRegistry";
-import LightMap from "./LightMap";
+// The map pulls ~10-25 OSM tiles (~20 KB each), so it loads only when the user opens it.
+const LightMap = lazy(() => import("./LightMap"));
 
 const WeatherCharts = lazy(() => import("./WeatherCharts"));
 
@@ -112,9 +120,10 @@ function initialState(): {
   activity: ActivityMode;
   range: DateRangeSelection;
   shouldAutoFetch: boolean;
+  highPoint: string;
 } {
   if (typeof window === "undefined") {
-    return { coordinates: null, center: DEFAULT_CENTER, activity: "hiking", range: { id: "next7" }, shouldAutoFetch: false };
+    return { coordinates: null, center: DEFAULT_CENTER, activity: "hiking", range: { id: "next7" }, shouldAutoFetch: false, highPoint: "" };
   }
   const params = new URLSearchParams(window.location.search);
   const latParam = params.get("lat");
@@ -124,7 +133,9 @@ function initialState(): {
   const activity = (params.get("activity") as ActivityMode) || "hiking";
   const rangeId = (params.get("range") as DateRangeSelection["id"]) || "next7";
   const parsed = latParam !== null && lngParam !== null ? validateCoordinates(lat, lng) : { ok: false as const };
-  const coordinates = parsed.ok ? parsed.coordinates! : null;
+  // No location in the URL: reopen the last place the user checked, so the app shows weather immediately.
+  const lastPlace = parsed.ok ? null : getRecentLocations()[0] ?? null;
+  const coordinates = parsed.ok ? parsed.coordinates! : lastPlace ? { lat: lastPlace.lat, lng: lastPlace.lng } : null;
   return {
     coordinates,
     center: coordinates || DEFAULT_CENTER,
@@ -134,8 +145,29 @@ function initialState(): {
       startDate: params.get("start") || undefined,
       endDate: params.get("end") || undefined
     },
-    shouldAutoFetch: Boolean(coordinates)
+    shouldAutoFetch: Boolean(coordinates),
+    highPoint: params.get("alt") || ""
   };
+}
+
+const WEEKEND_KEY = "trailwise:weekend";
+
+function readWeekend(): WeekendPreset {
+  try {
+    const saved = window.localStorage.getItem(WEEKEND_KEY) as WeekendPreset | null;
+    if (saved && weekendPresets.some((preset) => preset.id === saved)) return saved;
+  } catch {
+    // Storage can be blocked; fall back to the local custom.
+  }
+  return typeof window === "undefined" ? "sat-sun" : defaultWeekend();
+}
+
+function saveWeekend(value: WeekendPreset): void {
+  try {
+    window.localStorage.setItem(WEEKEND_KEY, value);
+  } catch {
+    // Not critical.
+  }
 }
 
 function forecastDates(forecast: OpenMeteoResponse): string[] {
@@ -162,7 +194,7 @@ function formatSavedAt(value: number | null): string {
   }).format(new Date(value));
 }
 
-function updateShareUrl(coordinates: Coordinates, activity: ActivityMode, range: DateRangeSelection) {
+function updateShareUrl(coordinates: Coordinates, activity: ActivityMode, range: DateRangeSelection, highPoint: number | null = null) {
   if (typeof window === "undefined") return;
   const params = new URLSearchParams({
     lat: coordinates.lat.toFixed(5),
@@ -174,6 +206,7 @@ function updateShareUrl(coordinates: Coordinates, activity: ActivityMode, range:
     params.set("start", range.startDate);
     params.set("end", range.endDate);
   }
+  if (highPoint) params.set("alt", `${highPoint}`);
   window.history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
 }
 
@@ -207,17 +240,20 @@ function ActivityModeSelector({
           );
         })}
       </div>
-      <p className="hint">{getActivityPreset(value).description}</p>
     </div>
   );
 }
 
 function DateRangeSelector({
   value,
-  onChange
+  onChange,
+  weekend,
+  onWeekend
 }: {
   value: DateRangeSelection;
   onChange: (range: DateRangeSelection) => void;
+  weekend: WeekendPreset;
+  onWeekend: (value: WeekendPreset) => void;
 }) {
   return (
     <div className="field-group">
@@ -243,6 +279,15 @@ function DateRangeSelector({
           </button>
         ))}
       </div>
+      {value.id === "weekend" ? (
+        <div className="segmented compact weekend-picker" role="group" aria-label="Weekend days">
+          {weekendPresets.map((preset) => (
+            <button key={preset.id} type="button" className={weekend === preset.id ? "is-selected" : ""} aria-pressed={weekend === preset.id} onClick={() => onWeekend(preset.id)}>
+              {preset.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
       {value.id === "custom" ? (
         <div className="split-inputs">
           <label>
@@ -380,126 +425,300 @@ function AdvancedVariableSelector({
   );
 }
 
-function OutdoorScoreCard({ day }: { day: ScoredDay }) {
+/** Renders children only once the placeholder scrolls near the viewport, so their code and data load on demand. */
+function WhenVisible({ children, placeholder }: { children: ComponentChildren; placeholder: ComponentChildren }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element || visible) return undefined;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "300px 0px" }
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [visible]);
+  return <div ref={ref}>{visible ? children : placeholder}</div>;
+}
+
+function formatReading(value: number | null, unit: string): string {
+  return value === null ? "–" : `${Math.round(value)}${unit}`;
+}
+
+function NowCard({ now }: { now: Nowcast }) {
+  const maxRain = Math.max(1, ...now.hours.map((hour) => hour.precipitation));
   return (
-    <section className={`score-card ${statusClass(day.label)}`} aria-labelledby="score-heading">
-      <div>
-        <p className="eyebrow">Outdoor score</p>
-        <h2 id="score-heading">{day.label}</h2>
-        <p>{day.summary}</p>
+    <section className={`now-card ${now.wetNow ? "is-wet" : ""}`} aria-labelledby="now-heading">
+      <div className="now-main">
+        <p className="eyebrow">Now · {now.time} local</p>
+        <h2 id="now-heading">
+          {now.wetNow ? <Umbrella size={22} aria-hidden="true" /> : <CloudSun size={22} aria-hidden="true" />}
+          {now.condition}, {formatReading(now.temperature, "°")}
+        </h2>
+        <p className="now-headline">{now.headline}</p>
+        <p className="now-details">
+          Feels {formatReading(now.apparent, "°")} · Wind {formatReading(now.wind, "")}–{formatReading(now.gust, " km/h")}
+          {now.precipitation !== null && now.precipitation > 0 ? ` · ${now.precipitation.toFixed(1)} mm/h` : ""}
+        </p>
       </div>
-      <div className="score-number" aria-label={`Score ${day.score} out of 100`}>
-        <span>{day.score}</span>
-        <small>/100</small>
-      </div>
+      <ol className="now-timeline" aria-label={`Rain over the next ${now.hours.length} hours`}>
+        {now.hours.map((hour) => (
+          <li key={hour.time} className={hour.wet ? "is-wet" : ""}>
+            <span className="now-bar" style={{ height: `${Math.max(6, (hour.precipitation / maxRain) * 100)}%` }} aria-hidden="true" />
+            <span className="now-prob">{hour.probability === null ? "" : `${Math.round(hour.probability)}%`}</span>
+            <span className="now-hour">{hour.time.slice(0, 2)}</span>
+            <span className="sr-only">
+              {hour.time}: {hour.wet ? "wet" : "dry"}, {hour.precipitation.toFixed(1)} mm
+            </span>
+          </li>
+        ))}
+      </ol>
     </section>
   );
 }
 
-function BestTimeWindowCard({ day }: { day: ScoredDay }) {
-  return (
-    <section className="result-card">
-      <div className="card-title">
-        <Clock size={18} aria-hidden="true" />
-        <h3>Best time window</h3>
-      </div>
-      {day.bestWindow ? (
-        <>
-          <p className="window-time">
-            {day.bestWindow.start} - {day.bestWindow.end}
-          </p>
-          <p>{day.bestWindow.reason}</p>
-        </>
-      ) : (
-        <p>No clean weather window stands out. Keep the plan shorter or choose another day.</p>
-      )}
-      {day.avoidWindow ? <p className="avoid-window">Avoid if possible: {day.avoidWindow.start} - {day.avoidWindow.end}.</p> : null}
-    </section>
-  );
+function shortLabel(label: string): string {
+  return label === "Mixed / Use caution" ? "Mixed" : label;
 }
 
-function RiskCards({ day }: { day: ScoredDay }) {
-  if (!day.risks.length) {
-    return (
-      <section className="result-card">
-        <div className="card-title">
-          <CheckCircle2 size={18} aria-hidden="true" />
-          <h3>Main risks</h3>
+interface HighPointView {
+  elevation: number;
+  day: ScoredDay | undefined;
+  summary: ReturnType<typeof summarizeHighPoint>;
+}
+
+function round(value: number | null, unit: string): string {
+  return value === null ? "–" : `${Math.round(value)}${unit}`;
+}
+
+function HighPointBlock({ high }: { high: HighPointView }) {
+  const { day, summary } = high;
+  return (
+    <div className={`high-point-block ${day ? statusClass(day.label) : ""}`}>
+      <h3>
+        <Mountain size={16} aria-hidden="true" />
+        At {high.elevation.toLocaleString("en")} m
+        {day ? (
+          <span className="high-point-score">
+            {shortLabel(day.label)} · {day.score}
+          </span>
+        ) : null}
+      </h3>
+      <dl>
+        <div>
+          <dt>Coldest feels-like</dt>
+          <dd>{round(summary.minFeelsLike, "°")}</dd>
         </div>
-        <p>No major weather risk stands out for the selected day.</p>
-      </section>
+        <div>
+          <dt>Strongest gust</dt>
+          <dd>{round(summary.maxGust, " km/h")}</dd>
+        </div>
+        <div>
+          <dt>Precipitation</dt>
+          <dd>{summary.precipitation === null ? "–" : `${summary.precipitation} mm`}</dd>
+        </div>
+        {summary.snowfall ? (
+          <div>
+            <dt>Snow</dt>
+            <dd>{summary.snowfall} cm</dd>
+          </div>
+        ) : null}
+        {summary.minFreezingLevel !== null ? (
+          <div>
+            <dt>Lowest freezing level</dt>
+            <dd>{Math.round(summary.minFreezingLevel).toLocaleString("en")} m</dd>
+          </div>
+        ) : null}
+      </dl>
+    </div>
+  );
+}
+
+function ModelCheck({ url, date }: { url: string; date: string }) {
+  const [state, setState] = useState<{ url: string; data: OpenMeteoResponse | null; error: boolean; loading: boolean } | null>(null);
+  const current = state?.url === url ? state : null;
+  const result: ModelAgreement | null = current?.data ? compareModelsForDate(current.data, date) : null;
+
+  async function load() {
+    setState({ url, data: null, error: false, loading: true });
+    try {
+      const response = await fetch(url);
+      const data = (await response.json()) as OpenMeteoResponse;
+      if (!response.ok || data.error) throw new Error(data.reason || "failed");
+      setState({ url, data, error: false, loading: false });
+    } catch {
+      setState({ url, data: null, error: true, loading: false });
+    }
+  }
+
+  if (!current) {
+    return (
+      <button type="button" className="link-button" onClick={() => void load()}>
+        <Layers size={16} aria-hidden="true" /> Compare weather models
+      </button>
+    );
+  }
+  if (current.loading) return <p className="muted">Checking ECMWF, GFS and ICON…</p>;
+  if (current.error || !result) {
+    return (
+      <p className="muted">
+        Model comparison isn’t available right now.{" "}
+        <button type="button" className="link-button" onClick={() => void load()}>
+          Try again
+        </button>
+      </p>
     );
   }
   return (
-    <section className="risk-grid" aria-label="Risk cards">
-      {day.risks.slice(0, 6).map((risk) => (
-        <article key={`${risk.id}-${risk.detail}`} className={`risk-card risk-${risk.level}`}>
-          <div className="card-title">
-            {risk.level === "severe" ? <ShieldAlert size={18} aria-hidden="true" /> : <AlertTriangle size={18} aria-hidden="true" />}
-            <h3>{risk.title}</h3>
-          </div>
-          <p>{risk.detail}</p>
-        </article>
-      ))}
-    </section>
+    <div className={`model-check ${result.agree ? "is-agree" : "is-disagree"}`}>
+      <p className="model-summary">{result.summary}</p>
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Model</th>
+            <th scope="col">Rain</th>
+            <th scope="col">High</th>
+            <th scope="col">Gusts</th>
+          </tr>
+        </thead>
+        <tbody>
+          {result.models.map((model) => (
+            <tr key={model.model}>
+              <th scope="row">{model.label}</th>
+              <td>{model.precipitation === null ? "–" : `${Math.round(model.precipitation * 10) / 10} mm`}</td>
+              <td>{round(model.temperatureMax, "°")}</td>
+              <td>{round(model.gustMax, " km/h")}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
-function GearSuggestions({ day }: { day: ScoredDay }) {
+function DayDetail({
+  day,
+  reasoning,
+  forecastElevation,
+  high,
+  rawUrl,
+  modelUrl
+}: {
+  day: ScoredDay;
+  reasoning: string;
+  forecastElevation?: number;
+  high: HighPointView | null;
+  rawUrl: string | null;
+  modelUrl: string | null;
+}) {
   return (
-    <section className="result-card">
-      <div className="card-title">
-        <Backpack size={18} aria-hidden="true" />
-        <h3>Gear suggestions</h3>
-      </div>
-      <div className="gear-list">
-        {day.gear.map((item) => (
-          <span key={item}>{item}</span>
-        ))}
-      </div>
-    </section>
-  );
-}
+    <section className={`day-detail ${statusClass(day.label)}`} aria-labelledby="day-detail-heading">
+      <header className="day-detail-head">
+        <div>
+          <p className="eyebrow">{formatDayLong(day.date)}</p>
+          <h2 id="day-detail-heading">{shortLabel(day.label)}</h2>
+          <p className="day-summary">{day.summary}</p>
+          {high?.day && day.score - high.day.score >= 15 ? (
+            <p className="high-warning" role="note">
+              <Mountain size={16} aria-hidden="true" />
+              Much worse at {high.elevation.toLocaleString("en")} m: {shortLabel(high.day.label)} ({high.day.score}). Plan for the high point, not the valley.
+            </p>
+          ) : null}
+        </div>
+        <p className="score-badge" aria-label={`Score ${day.score} out of 100`}>
+          <strong>{day.score}</strong>
+          <span aria-hidden="true">/100</span>
+        </p>
+      </header>
 
-function DailyExplanationList({ days, activity }: { days: ScoredDay[]; activity: ActivityMode }) {
-  const explanations = explainForecast(days, getActivityPreset(activity).label);
-  return (
-    <section className="daily-section" aria-labelledby="daily-heading">
-      <div className="section-heading">
-        <p className="eyebrow">Day by day</p>
-        <h2 id="daily-heading">Daily explanation</h2>
+      <div className="day-detail-grid">
+        <div className="detail-block">
+          <h3>
+            <Clock size={16} aria-hidden="true" />
+            Best time
+          </h3>
+          {day.bestWindow ? (
+            <>
+              <p className="window-time">
+                {day.bestWindow.start}–{day.bestWindow.end}
+              </p>
+              <p className="muted">{day.bestWindow.reason}</p>
+            </>
+          ) : (
+            <p>No dry window stands out. Keep the plan short or pick another day.</p>
+          )}
+          {day.avoidWindow ? (
+            <p className="avoid-window">
+              Avoid {day.avoidWindow.start}–{day.avoidWindow.end}
+            </p>
+          ) : null}
+          {day.fromTime ? <p className="window-note">Judged from {day.fromTime}; earlier hours today are ignored.</p> : null}
+        </div>
+
+        <div className="detail-block">
+          <h3>
+            <ShieldAlert size={16} aria-hidden="true" />
+            Risks
+          </h3>
+          {day.risks.length ? (
+            <ul className="risk-list">
+              {day.risks.slice(0, 6).map((risk) => (
+                <li key={`${risk.id}-${risk.detail}`} className={`risk-${risk.level}`}>
+                  {risk.level === "severe" ? <ShieldAlert size={16} aria-hidden="true" /> : <AlertTriangle size={16} aria-hidden="true" />}
+                  <span>
+                    <strong>{risk.title}</strong>
+                    <span className="sr-only"> ({risk.level})</span>
+                    <span className="risk-detail">{risk.detail}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="risk-none">
+              <CheckCircle2 size={16} aria-hidden="true" /> No major weather risk stands out.
+            </p>
+          )}
+        </div>
+
+        <div className="detail-block">
+          <h3>
+            <Backpack size={16} aria-hidden="true" />
+            Bring
+          </h3>
+          <ul className="gear-list">
+            {day.gear.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
       </div>
-      <div className="daily-list">
-        {days.map((day, index) => {
-          const explanation = explanations[index];
-          return (
-            <article key={day.date} className="daily-item">
-              <div>
-                <h3>{formatDayLong(day.date)}</h3>
-                <p>{explanation.summarySentence}</p>
-              </div>
-              <dl>
-                <div>
-                  <dt>Best window</dt>
-                  <dd>{explanation.bestTimeWindow}</dd>
-                </div>
-                <div>
-                  <dt>Main risks</dt>
-                  <dd>{explanation.mainRisks}</dd>
-                </div>
-                <div>
-                  <dt>Gear</dt>
-                  <dd>{explanation.gearSuggestions}</dd>
-                </div>
-                <div>
-                  <dt>Reasoning</dt>
-                  <dd>{explanation.reasoning}</dd>
-                </div>
-              </dl>
-            </article>
-          );
-        })}
-      </div>
+
+      {high ? <HighPointBlock high={high} /> : null}
+
+      <details className="why">
+        <summary>Why this score</summary>
+        <p>{reasoning}</p>
+      </details>
+
+      <p className="detail-footer">
+        {typeof forecastElevation === "number" ? <span>Forecast for {Math.round(forecastElevation).toLocaleString("en")} m</span> : null}
+        {rawUrl ? (
+          <a href={rawUrl} target="_blank" rel="noopener noreferrer">
+            See raw data on Open-Meteo <ExternalLink size={14} aria-hidden="true" />
+          </a>
+        ) : null}
+      </p>
+      {modelUrl ? <ModelCheck key={`${modelUrl}-${day.date}`} url={modelUrl} date={day.date} /> : null}
     </section>
   );
 }
@@ -511,8 +730,12 @@ function ForecastResults({
   selection,
   lastUpdated,
   stale,
-  location,
-  refreshing
+  refreshing,
+  highDays,
+  highForecast,
+  highPoint,
+  rawUrl,
+  modelUrl
 }: {
   forecast: OpenMeteoResponse;
   activity: ActivityMode;
@@ -520,13 +743,19 @@ function ForecastResults({
   selection: VariableSelection;
   lastUpdated: number | null;
   stale: boolean;
-  location: Coordinates | null;
   refreshing: boolean;
+  highDays: ScoredDay[];
+  highForecast: OpenMeteoResponse | null;
+  highPoint: number | null;
+  rawUrl: string | null;
+  modelUrl: string | null;
 }) {
   const summary = summarizeScores(days);
   const best = summary.bestDay || days[0];
   const [pickedDate, setPickedDate] = useState<string | null>(null);
   const featured = days.find((day) => day.date === pickedDate) || best;
+  const now = useMemo(() => buildNowcast(forecast), [forecast]);
+  const explanations = useMemo(() => explainForecast(days, getActivityPreset(activity).label), [days, activity]);
   if (!featured) {
     return (
       <section className="results-empty">
@@ -534,86 +763,64 @@ function ForecastResults({
       </section>
     );
   }
+  const featuredReasoning = explanations[days.indexOf(featured)]?.reasoning ?? featured.details;
 
   return (
     <div className={`results-content ${refreshing ? "is-refreshing" : ""}`} aria-busy={refreshing}>
-      <section className="activity-summary">
-        <div>
-          <p className="eyebrow">
-            {getActivityPreset(activity).label} plan{location ? ` · ${formatCoordinates(location)}` : ""}
-          </p>
-          <h2>
-            Best day is {formatDayLong(best.date)}: {best.label}
+      {now ? <NowCard now={now} /> : null}
+
+      <section className="days-section" aria-labelledby="days-heading">
+        <div className="section-row">
+          <h2 id="days-heading">
+            {getActivityPreset(activity).label} · {days.length} {days.length === 1 ? "day" : "days"}
           </h2>
-          <p>
-            {best.bestWindow ? `Go between ${best.bestWindow.start} and ${best.bestWindow.end}. ` : "No clean window that day. "}
-            Tap any day below to see its details.
+          <p className={`updated-pill ${stale ? "is-stale" : ""}`} aria-live="polite">
+            {refreshing ? <LoaderCircle className="spin" size={14} aria-hidden="true" /> : null}
+            <span>{refreshing ? "Updating…" : `${stale ? "Offline copy ·" : "Updated"} ${formatSavedAt(lastUpdated)}`}</span>
           </p>
         </div>
-        <div className={`updated-pill ${stale ? "is-stale" : ""}`}>
-          {refreshing ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <CloudSun size={16} aria-hidden="true" />}
-          <span>{refreshing ? "Updating…" : `${stale ? "Offline copy from" : "Updated"} ${formatSavedAt(lastUpdated)}`}</span>
+        <div className="daily-score-strip" role="group" aria-label="Pick a day">
+          {days.map((day) => {
+            const date = new Date(`${day.date}T12:00:00`);
+            const isBest = day.date === best.date && days.length > 1;
+            return (
+              <button
+                key={day.date}
+                type="button"
+                className={`daily-score ${statusClass(day.label)} ${day.date === featured.date ? "is-selected" : ""}`}
+                aria-pressed={day.date === featured.date}
+                aria-label={`${formatDayLong(day.date)}: ${day.label}, score ${day.score}${isBest ? ", best day" : ""}`}
+                onClick={() => setPickedDate(day.date)}
+              >
+                <span className="ds-day">{new Intl.DateTimeFormat("en", { weekday: "short" }).format(date)}</span>
+                <span className="ds-date">{date.getDate()}</span>
+                <strong>{day.score}</strong>
+                <small>{shortLabel(day.label)}</small>
+                {isBest ? <span className="ds-best">Best</span> : null}
+              </button>
+            );
+          })}
         </div>
       </section>
 
-      <section className="daily-score-strip" aria-label="Pick a day">
-        {days.map((day) => (
-          <button
-            key={day.date}
-            type="button"
-            className={`daily-score ${statusClass(day.label)} ${day.date === featured.date ? "is-selected" : ""}`}
-            aria-pressed={day.date === featured.date}
-            onClick={() => setPickedDate(day.date)}
-          >
-            <span>
-              {new Intl.DateTimeFormat("en", { weekday: "short", day: "numeric" }).format(new Date(`${day.date}T12:00:00`))}
-              {day.date === best.date ? " ★" : ""}
-            </span>
-            <strong>{day.score}</strong>
-            <small>{day.label}</small>
-          </button>
-        ))}
-      </section>
+      <DayDetail
+        day={featured}
+        reasoning={featuredReasoning}
+        forecastElevation={forecast.elevation}
+        high={
+          highPoint && highForecast
+            ? { elevation: highPoint, day: highDays.find((day) => day.date === featured.date), summary: summarizeHighPoint(highForecast, featured.date) }
+            : null
+        }
+        rawUrl={rawUrl}
+        modelUrl={modelUrl}
+      />
 
-      <h3 className="featured-day-title">{formatDayLong(featured.date)}</h3>
-      <div className="score-layout">
-        <OutdoorScoreCard day={featured} />
-        <BestTimeWindowCard day={featured} />
-        <GearSuggestions day={featured} />
-      </div>
-
-      <RiskCards day={featured} />
-
-      <section className="weather-summary" aria-labelledby="summary-heading">
-        <div className="section-heading">
-          <p className="eyebrow">Week scan</p>
-          <h2 id="summary-heading">Weather summary</h2>
-        </div>
-        <dl>
-          <div>
-            <dt>Best day</dt>
-            <dd>{summary.bestDay ? `${formatDayLong(summary.bestDay.date)} (${summary.bestDay.label})` : "Not available"}</dd>
-          </div>
-          <div>
-            <dt>Worst day</dt>
-            <dd>{summary.worstDay ? `${formatDayLong(summary.worstDay.date)} (${summary.worstDay.label})` : "Not available"}</dd>
-          </div>
-          <div>
-            <dt>Best activity window</dt>
-            <dd>{summary.bestWindow ? `${summary.bestWindow.start}-${summary.bestWindow.end}` : "No strong window found"}</dd>
-          </div>
-          <div>
-            <dt>Main risk</dt>
-            <dd>{summary.mainRisk}</dd>
-          </div>
-        </dl>
-      </section>
-
-      <DailyExplanationList days={days} activity={activity} />
-
-      <Suspense fallback={<div className="chart-skeleton">Loading charts...</div>}>
-        <WeatherCharts forecast={forecast} selection={selection} />
-      </Suspense>
+      <WhenVisible placeholder={<div className="chart-skeleton">Charts load when you scroll here</div>}>
+        <Suspense fallback={<div className="chart-skeleton">Loading charts…</div>}>
+          <WeatherCharts forecast={forecast} selection={selection} />
+        </Suspense>
+      </WhenVisible>
     </div>
   );
 }
@@ -646,6 +853,23 @@ export default function OutdoorPlanner() {
   const [stale, setStale] = useState(false);
   const [recentLocations, setRecentLocations] = useState<RecentLocation[]>([]);
   const [shareStatus, setShareStatus] = useState("");
+  // The map is the heaviest thing on a 3G link, so it stays closed whenever we already know a place.
+  // It starts closed on server and client alike (hydration does not patch class names), then opens
+  // after mount only for first-time users who have no location yet.
+  const [mapOpen, setMapOpen] = useState(false);
+  const [weekend, setWeekend] = useState<WeekendPreset>("sat-sun");
+  const [highPointText, setHighPointText] = useState(initial.highPoint);
+  const [highForecast, setHighForecast] = useState<OpenMeteoResponse | null>(null);
+  const highPoint = parseElevation(highPointText);
+  useEffect(() => setWeekend(readWeekend()), []);
+  // Returning users see the weather first; the full form only opens by default for first-time users.
+  const [formOpen, setFormOpen] = useState(false);
+  useEffect(() => {
+    if (!initial.coordinates) {
+      setMapOpen(true);
+      setFormOpen(true);
+    }
+  }, []);
   const [splitError, setSplitError] = useState("");
 
   useEffect(() => {
@@ -714,10 +938,10 @@ export default function OutdoorPlanner() {
       longitude: nextCoordinates.lng,
       activity,
       forecastDays: forecastDaysForRange(range),
-      variables: selection
+      variables: withCoreVariables(selection)
     };
     const cacheKey = makeForecastCacheKey(request);
-    updateShareUrl(nextCoordinates, activity, range);
+    updateShareUrl(nextCoordinates, activity, range, parseElevation(highPointText));
     setError("");
     setNotice("");
     setShareStatus("");
@@ -731,6 +955,16 @@ export default function OutdoorPlanner() {
         setNotice("Loaded a recent cached forecast.");
         if (scroll) requestAnimationFrame(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
         return;
+      }
+    }
+
+    // Show the last saved forecast for this place right away (marked as an offline copy) while the network catches up.
+    if (!forceRefresh) {
+      const previous = getCachedForecast(cacheKey, true);
+      if (previous) {
+        setForecast(previous.data);
+        setLastUpdated(previous.savedAt);
+        setStale(true);
       }
     }
 
@@ -865,13 +1099,66 @@ export default function OutdoorPlanner() {
 
   const scoredDays = useMemo(() => {
     if (!forecast) return [];
-    const dates = filterDatesForRange(forecastDates(forecast), range);
+    const dates = filterDatesForRange(forecastDates(forecast), range, new Date(), weekend);
     return scoreForecast(forecast, activity, dates);
-  }, [forecast, activity, range.id, range.startDate, range.endDate]);
+  }, [forecast, activity, range.id, range.startDate, range.endDate, weekend]);
+
+  // High point (summit, pass): a second forecast downscaled to that elevation, fetched only when set.
+  useEffect(() => {
+    if (!forecast || !coordinates || !highPoint) {
+      setHighForecast(null);
+      return undefined;
+    }
+    const request: ForecastRequest = {
+      latitude: coordinates.lat,
+      longitude: coordinates.lng,
+      activity,
+      forecastDays: forecastDaysForRange(range),
+      variables: withCoreVariables(selection),
+      elevation: highPoint
+    };
+    const key = makeForecastCacheKey(request);
+    const cached = getCachedForecast(key);
+    if (cached) {
+      setHighForecast(cached.data);
+      return undefined;
+    }
+    const controller = new AbortController();
+    fetchOpenMeteoForecast(request, controller.signal)
+      .then((data) => {
+        setCachedForecast(key, data);
+        setHighForecast(data);
+      })
+      .catch(() => {
+        const stale = getCachedForecast(key, true);
+        setHighForecast(stale ? stale.data : null);
+      });
+    return () => controller.abort();
+  }, [forecast, highPoint, coordinates?.lat, coordinates?.lng]);
+
+  const highDays = useMemo(() => {
+    if (!highForecast) return [];
+    return scoreForecast(highForecast, activity, scoredDays.map((day) => day.date));
+  }, [highForecast, activity, scoredDays]);
+
+  const rawUrl = useMemo(() => {
+    if (!coordinates) return null;
+    try {
+      return buildForecastUrl({
+        latitude: coordinates.lat,
+        longitude: coordinates.lng,
+        activity,
+        forecastDays: forecastDaysForRange(range),
+        variables: withCoreVariables(selection)
+      });
+    } catch {
+      return null;
+    }
+  }, [coordinates?.lat, coordinates?.lng, activity, range.id, selection]);
 
   async function shareForecast() {
     if (!coordinates || typeof window === "undefined") return;
-    updateShareUrl(coordinates, activity, range);
+    updateShareUrl(coordinates, activity, range, parseElevation(highPointText));
     try {
       await navigator.clipboard.writeText(window.location.href);
       setShareStatus("Link copied");
@@ -897,21 +1184,50 @@ export default function OutdoorPlanner() {
         </div>
       </header>
 
-      <section className="planner-hero" aria-label="Outdoor weather planner">
-        <div className="map-panel">
-          <LightMap selected={coordinates} center={center} onSelect={(next) => setSelectedLocation(next, "map")} />
-          <div className="map-status">
+      {coordinates ? (
+        <section className="plan-bar" aria-label="Current plan">
+          <button type="button" className="plan-bar-summary" onClick={() => setFormOpen((open) => !open)} aria-expanded={formOpen} aria-controls="plan-form">
             <MapPin size={16} aria-hidden="true" />
-            <span>{coordinates ? formatCoordinates(coordinates) : "Tap the map to drop a pin"}</span>
+            <span className="plan-bar-text">
+              <strong>{formatCoordinates(coordinates)}</strong>
+              <span>
+                {getActivityPreset(activity).label} · {dateRangeOptions.find((option) => option.id === range.id)?.label ?? "Custom"}
+              </span>
+            </span>
+            <span className="plan-bar-edit">
+              <SlidersHorizontal size={16} aria-hidden="true" />
+              {formOpen ? "Close" : "Edit"}
+            </span>
+          </button>
+          <button type="button" className="icon-button" onClick={() => void requestForecast(coordinates, true, false)} disabled={loading} aria-label="Refresh forecast" title="Refresh forecast">
+            <RefreshCcw size={18} className={loading ? "spin" : ""} aria-hidden="true" />
+          </button>
+        </section>
+      ) : null}
+
+      {formOpen ? (
+      <section id="plan-form" className={`planner-hero ${mapOpen ? "" : "map-closed"}`} aria-label="Outdoor weather planner">
+        {mapOpen ? (
+          <div className="map-panel">
+            <Suspense fallback={<div className="map-loading">Loading map…</div>}>
+              <LightMap selected={coordinates} center={center} onSelect={(next) => setSelectedLocation(next, "map")} />
+            </Suspense>
+            <div className="map-status">
+              <MapPin size={16} aria-hidden="true" />
+              <span>{coordinates ? formatCoordinates(coordinates) : "Tap the map to drop a pin"}</span>
+            </div>
           </div>
-        </div>
+        ) : null}
 
         <aside className="control-panel" aria-label="Plan controls">
-          <div className="panel-heading">
-            <p className="eyebrow">Outdoor decision assistant</p>
-            <h1>Plan the right weather window</h1>
-            <p>Check suitability, timing, risks, and gear from Open-Meteo forecast data.</p>
-          </div>
+          {coordinates ? (
+            <h1 className="sr-only">Trailwise weather planner</h1>
+          ) : (
+            <div className="panel-heading">
+              <h1>Plan the right weather window</h1>
+              <p>Pick a place, an activity and dates. You get a score per day, the best hours, risks and gear.</p>
+            </div>
+          )}
 
           <div className="field-group">
             <div className="control-label">
@@ -940,8 +1256,20 @@ export default function OutdoorPlanner() {
               <button type="button" className="icon-button" onClick={() => requestLocation(false)} aria-label="Use my location" title="Use my location">
                 <LocateFixed size={18} aria-hidden="true" />
               </button>
+              <button
+                type="button"
+                className={`icon-button ${mapOpen ? "is-active" : ""}`}
+                onClick={() => setMapOpen((open) => !open)}
+                aria-pressed={mapOpen}
+                aria-label={mapOpen ? "Hide map" : "Pick on map"}
+                title={mapOpen ? "Hide map" : "Pick on map (uses more data)"}
+              >
+                <MapPin size={18} aria-hidden="true" />
+              </button>
             </div>
             {coordinateError ? <p id="coordinate-error" className="error-text">{coordinateError}</p> : null}
+            <details className="more-location">
+              <summary>Enter latitude and longitude separately</summary>
             <div className="split-inputs two">
               <label>
                 <span>Latitude</span>
@@ -973,6 +1301,22 @@ export default function OutdoorPlanner() {
               </label>
             </div>
             {splitError ? <p className="error-text">{splitError}</p> : null}
+            </details>
+            <label className="high-point">
+              <span>
+                High point <small>optional, metres</small>
+              </span>
+              <input
+                value={highPointText}
+                onInput={(event) => setHighPointText(event.currentTarget.value)}
+                inputMode="numeric"
+                placeholder="e.g. 3200 for a summit or pass"
+                aria-describedby="high-point-help"
+              />
+              <small id="high-point-help" className="muted">
+                Adds a second forecast for that elevation. Mountain weather can differ a lot from the valley.
+              </small>
+            </label>
             {recentLocations.length ? (
               <div className="recent-list" aria-label="Recent locations">
                 {recentLocations
@@ -987,11 +1331,22 @@ export default function OutdoorPlanner() {
           </div>
 
           <ActivityModeSelector value={activity} onChange={setActivity} />
-          <DateRangeSelector value={range} onChange={setRange} />
+          <DateRangeSelector
+            value={range}
+            onChange={setRange}
+            weekend={weekend}
+            onWeekend={(next) => {
+              setWeekend(next);
+              saveWeekend(next);
+            }}
+          />
           <AdvancedVariableSelector activity={activity} selection={selection} onChange={setSelection} />
 
           <div className="action-row">
-            <button type="button" className="primary-button" onClick={() => void requestForecast(coordinates)} disabled={loading || !coordinates}>
+            <button type="button" className="primary-button" onClick={() => {
+                void requestForecast(coordinates);
+                if (coordinates) setFormOpen(false);
+              }} disabled={loading || !coordinates}>
               {loading ? <LoaderCircle className="spin" size={18} aria-hidden="true" /> : <CloudSun size={18} aria-hidden="true" />}
               <span>{loading ? "Checking forecast…" : coordinates ? "Check outdoor plan" : "Pick a location first"}</span>
             </button>
@@ -1000,25 +1355,26 @@ export default function OutdoorPlanner() {
             </button>
           </div>
 
-          <div className="panel-meta">
-            <span>Provider: Open-Meteo Forecast API</span>
-            <span>{selection.hourly.length + selection.daily.length + selection.current.length} variables selected</span>
-          </div>
           {notice ? <p className="notice-text">{notice}</p> : null}
           {shareStatus ? <p className="notice-text">{shareStatus}</p> : null}
           {error ? <p className="error-text">{error}</p> : null}
         </aside>
       </section>
+      ) : null}
+      {!formOpen && (notice || error || shareStatus) ? (
+        <div className="status-line" role="status">
+          {notice ? <p className="notice-text">{notice}</p> : null}
+          {shareStatus ? <p className="notice-text">{shareStatus}</p> : null}
+          {error ? <p className="error-text">{error}</p> : null}
+        </div>
+      ) : null}
 
       <div ref={resultsRef} className="results-anchor">
         {loading && !forecast ? (
-          <section className="loading-state" aria-live="polite">
-            <div className="skeleton large" />
-            <div className="skeleton-grid">
-              <div className="skeleton" />
-              <div className="skeleton" />
-              <div className="skeleton" />
-            </div>
+          <section className="loading-state" aria-live="polite" aria-label="Loading forecast">
+            <div className="skeleton now" />
+            <div className="skeleton strip" />
+            <div className="skeleton detail" />
           </section>
         ) : null}
 
@@ -1030,8 +1386,12 @@ export default function OutdoorPlanner() {
             selection={selection}
             lastUpdated={lastUpdated}
             stale={stale}
-            location={coordinates}
             refreshing={loading}
+            highDays={highDays}
+            highForecast={highForecast}
+            highPoint={highPoint}
+            rawUrl={rawUrl}
+            modelUrl={coordinates ? buildModelComparisonUrl(coordinates.lat, coordinates.lng, forecastDaysForRange(range)) : null}
           />
         ) : (
           <section className="empty-results">
@@ -1044,6 +1404,13 @@ export default function OutdoorPlanner() {
           </section>
         )}
       </div>
+      <footer className="app-footer">
+        Weather data by{" "}
+        <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">
+          Open-Meteo.com
+        </a>{" "}
+        (CC BY 4.0) · Map © OpenStreetMap contributors
+      </footer>
     </main>
   );
 }
